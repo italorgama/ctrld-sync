@@ -1,9 +1,9 @@
 name: Sync
 
 on:
-  # Daily at 02:00 UTC
+  # Daily at 06:00 UTC
   schedule:
-    - cron: "0 2 * * *"
+    - cron: "0 6 * * *"
   # Manual trigger
   workflow_dispatch:
 
@@ -20,11 +20,19 @@ jobs:
         with:
           enable-cache: true
 
-      - name: Install Python & dependencies
+      - name: Install Python dependencies
         run: uv sync --frozen
 
+      - name: Create .env file with secrets
+        run: |
+          cat <<EOF > .env
+          PROFILE_1_ID=${{ secrets.PROFILE_1_ID }}
+          PROFILE_1_TOKEN=${{ secrets.PROFILE_1_TOKEN }}
+          PROFILE_2_ID=${{ secrets.PROFILE_2_ID }}
+          PROFILE_2_TOKEN=${{ secrets.PROFILE_2_TOKEN }}
+          PROFILE_3_ID=${{ secrets.PROFILE_3_ID }}
+          PROFILE_3_TOKEN=${{ secrets.PROFILE_3_TOKEN }}
+          EOF
+
       - name: Run sync script
-        env:
-          TOKEN: ${{ secrets.TOKEN }}
-          PROFILE: ${{ secrets.PROFILE }}
         run: uv run python main.py

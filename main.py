@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
 """
-Control D Sync
+Control D Sync (multi-profile)
 ----------------------
-A tiny helper that keeps your Control D folders in sync with a set of
-remote block-lists.
+Sincroniza múltiplos perfis do Control D com listas públicas do Hagezi.
 
-It does three things:
-1. Reads the folder names from the JSON files.
-2. Deletes any existing folders with those names (so we start fresh).
-3. Re-creates the folders and pushes all rules in batches.
+Para cada perfil:
+1. Lê as pastas das listas.
+2. Remove as pastas existentes com os mesmos nomes.
+3. Cria as pastas novamente.
+4. Adiciona os domínios bloqueados em lotes.
 
-Nothing fancy, just works.
+Configure seu arquivo `.env` com:
+- PROFILE_1_ID
+- PROFILE_1_TOKEN
+- PROFILE_2_ID
+- PROFILE_2_TOKEN
+...
 """
 
 import os
@@ -37,22 +42,13 @@ log = logging.getLogger("control-d-sync")
 # 1. Constants – tweak only here
 # --------------------------------------------------------------------------- #
 API_BASE = "https://api.controld.com/profiles"
-TOKEN = os.getenv("TOKEN")
 
-# Accept either a single profile id or a comma-separated list
-PROFILE_IDS = [p.strip() for p in os.getenv("PROFILE", "").split(",") if p.strip()]
-
-# URLs of the JSON block-lists we want to import
 FOLDER_URLS = [
-    "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/controld/badware-hoster-folder.json",
-    "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/controld/native-tracker-amazon-folder.json",
-    "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/controld/native-tracker-microsoft-folder.json",
-    "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/controld/native-tracker-tiktok-aggressive-folder.json",
-    "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/controld/referral-allow-folder.json",
-    "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/controld/spam-idns-folder.json",
-    "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/controld/spam-tlds-allow-folder.json",
     "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/controld/spam-tlds-folder.json",
+    "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/controld/spam-tlds-allow-folder.json",
     "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/controld/ultimate-known_issues-allow-folder.json",
+    "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/controld/spam-idns-folder.json",
+    "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/controld/native-tracker-lgwebos-folder.json",
 ]
 
 BATCH_SIZE = 500
@@ -60,94 +56,62 @@ BATCH_SIZE = 500
 # --------------------------------------------------------------------------- #
 # 2. Clients
 # --------------------------------------------------------------------------- #
-# Control-D API client (with auth)
-_api = httpx.Client(
-    headers={
-        "Accept": "application/json",
-        "Authorization": f"Bearer {TOKEN}",
-    },
-    timeout=30,
-)
-
-# GitHub raw client (no auth, no headers)
+_api = httpx.Client(timeout=30)
 _gh = httpx.Client(timeout=30)
+_cache: Dict[str, Dict] = {}
 
 # --------------------------------------------------------------------------- #
 # 3. Helpers
 # --------------------------------------------------------------------------- #
-# simple in-memory cache: url -> decoded JSON
-_cache: Dict[str, Dict] = {}
-
-
 def _api_get(url: str) -> httpx.Response:
-    """GET helper for Control-D API."""
     r = _api.get(url)
     r.raise_for_status()
     return r
 
-
 def _api_delete(url: str) -> httpx.Response:
-    """DELETE helper for Control-D API."""
     r = _api.delete(url)
     r.raise_for_status()
     return r
 
-
 def _api_post(url: str, data: Dict) -> httpx.Response:
-    """POST helper for Control-D API."""
     r = _api.post(url, data=data)
     r.raise_for_status()
     return r
 
-
 def _gh_get(url: str) -> Dict:
-    """Fetch JSON from GitHub (cached)."""
     if url not in _cache:
         r = _gh.get(url)
         r.raise_for_status()
         _cache[url] = r.json()
     return _cache[url]
 
-
 def list_existing_folders(profile_id: str) -> Dict[str, str]:
-    """Return folder-name -> folder-id mapping."""
     data = _api_get(f"{API_BASE}/{profile_id}/groups").json()
     folders = data.get("body", {}).get("groups", [])
     return {
-        f["group"].strip(): f["PK"]
+        f["group"].strip().lower(): f["PK"]
         for f in folders
         if f.get("group") and f.get("PK")
     }
 
-
 def fetch_folder_name(url: str) -> str:
-    """Return folder name from GitHub JSON."""
-    return _gh_get(url)["group"]["group"].strip()
-
+    return _gh_get(url)["group"]["group"].strip().lower()
 
 def delete_folder(profile_id: str, name: str, folder_id: str) -> None:
-    """Delete a single folder by its ID."""
     _api_delete(f"{API_BASE}/{profile_id}/groups/{folder_id}")
     log.info("Deleted folder '%s' (ID %s)", name, folder_id)
 
-
 def create_folder(profile_id: str, name: str, do: int, status: int) -> str:
-    """
-    Create a new folder and return its ID.
-    The API returns the full list of groups, so we look for the one we just added.
-    """
     _api_post(
         f"{API_BASE}/{profile_id}/groups",
         data={"name": name, "do": do, "status": status},
     )
-    # Re-fetch the list and pick the folder we just created
     data = _api_get(f"{API_BASE}/{profile_id}/groups").json()
     for grp in data["body"]["groups"]:
-        if grp["group"].strip() == name.strip():
+        if grp["group"].strip().lower() == name.strip().lower():
             log.info("Created folder '%s' (ID %s)", name, grp["PK"])
             return str(grp["PK"])
     raise RuntimeError(f"Folder '{name}' was not found after creation")
-
 
 def push_rules(
     profile_id: str,
@@ -157,7 +121,6 @@ def push_rules(
     status: int,
     hostnames: List[str],
 ) -> None:
-    """Push hostnames in batches to the given folder."""
     for i, start in enumerate(range(0, len(hostnames), BATCH_SIZE), 1):
         batch = hostnames[start : start + BATCH_SIZE]
         _api_post(
@@ -177,15 +140,17 @@ def push_rules(
         )
     log.info("Folder '%s' – finished (%d total rules)", folder_name, len(hostnames))
 
+# --------------------------------------------------------------------------- #
+# 4. Main sync logic per profile
+# --------------------------------------------------------------------------- #
+def sync_profile(profile_id: str, token: str) -> None:
+    log.info("Starting sync for profile: %s", profile_id)
 
-# --------------------------------------------------------------------------- #
-# 4. Main workflow
-# --------------------------------------------------------------------------- #
-def sync_profile(profile_id: str) -> None:
-    """One-shot sync: delete old, create new, push rules."""
+    _api.headers["Authorization"] = f"Bearer {token}"
+
     wanted_names = [fetch_folder_name(u) for u in FOLDER_URLS]
-
     existing = list_existing_folders(profile_id)
+
     for name in wanted_names:
         if name in existing:
             delete_folder(profile_id, name, existing[name])
@@ -194,8 +159,11 @@ def sync_profile(profile_id: str) -> None:
         js = _gh_get(url)
         grp = js["group"]
         folder_name = grp["group"]
-        do = grp["action"]["do"]
-        status = grp["action"]["status"]
+        action = grp.get("action", {})
+        if "do" not in action or "status" not in action:
+            raise ValueError(f"Invalid action block in list from {url}: {action}")
+        do = action["do"]
+        status = action["status"]
         hostnames = [r["PK"] for r in js.get("rules", []) if r.get("PK")]
 
         folder_id = create_folder(profile_id, folder_name, do, status)
@@ -204,17 +172,25 @@ def sync_profile(profile_id: str) -> None:
         else:
             log.info("Folder '%s' - no rules to push", folder_name)
 
-    log.info("Sync complete ✔")
-
+    log.info("✅ Sync complete for profile: %s", profile_id)
 
 # --------------------------------------------------------------------------- #
 # 5. Entry-point
 # --------------------------------------------------------------------------- #
 if __name__ == "__main__":
-    if not TOKEN or not PROFILE_IDS:
-        log.error("TOKEN and/or PROFILE missing - check your .env file")
-        exit(1)
+    PROFILES = [
+        {"id": os.getenv("PROFILE_1_ID"), "token": os.getenv("PROFILE_1_TOKEN")},
+        {"id": os.getenv("PROFILE_2_ID"), "token": os.getenv("PROFILE_2_TOKEN")},
+        {"id": os.getenv("PROFILE_3_ID"), "token": os.getenv("PROFILE_3_TOKEN")},
+    ]
 
-    for profile_id in PROFILE_IDS:
-        log.info("Starting sync for profile %s", profile_id)
-        sync_profile(profile_id)
+    for profile in PROFILES:
+        pid = profile.get("id")
+        token = profile.get("token")
+        if not pid or not token:
+            log.warning("⚠️  Skipping profile with missing ID or token.")
+            continue
+        try:
+            sync_profile(pid, token)
+        except Exception as e:
+            log.error("❌ Failed to sync profile %s: %s", pid, e)
